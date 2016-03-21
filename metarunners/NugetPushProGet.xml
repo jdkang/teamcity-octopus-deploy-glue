@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<meta-runner name="NuGet Push to ProGet">
+  <description>Searches directories for .nupkg, sorts packages by pre-release/standard, and pushes packages to apropos main/dev repos.</description>
+  <settings>
+    <parameters>
+      <param name="nugetpusher.feedbaseurl" value="https://nuget.contoso.local/nuget" spec= "validationMode='not_empty' display='normal' label='NuGet Feed Base URL'" />
+      <param name="nugetpusher.apikey" value="zxx775d03cbe80d301b" spec="password display='normal' label='NuGet API Key'" />
+      <param name="nugetpusher.packageDirs" value="%system.teamcity.build.checkoutDir%\package" spec="text description='Newline delimited' label='Directories to Search for .nupkg' validationMode='not_empty' display='normal'" />
+      <param name="nugetpusher.regexFilter" value="(?i)^cardinal\..*?\.nupkg$" spec="text description='Only packages that match this regex. Use .* to match anything' label='Regex Match' validationMode='not_empty' display='normal'" />
+      <param name="nugetpusher.shouldRecurse" value="" spec="select label='Recurse Directories' data_2='true' data_1='false' display='normal'" />
+    </parameters>
+    <build-runners>
+      <runner name="" type="jetbrains_powershell">
+        <parameters>
+          <param name="jetbrains_powershell_bitness" value="x64" />
+          <param name="jetbrains_powershell_execution" value="PS1" />
+          <param name="jetbrains_powershell_minVersion" value="3.0" />
+          <param name="jetbrains_powershell_script_code"><![CDATA[<#
+    .SYNOPSIS
+    Publishes packages to ProGet dev/main repos.
+    
+    .DESCRIPTION
+    Sorts packages with logic to discern which pre-release/etc .nupkg should go to DEV and which should go to MAIN
+#>
+function Pretty-Exception {
+param(
+    [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+    [System.Management.Automation.ErrorRecord[]]
+    $exceptions
+)
+PROCESS {
+    $exceptions | % {
+        write-host "---------------------------------------" -f 'red'
+        write-host "ERROR RECORD" -f 'red'
+        write-host "---------------------------------------" -f 'red'
+        write-host "MESSAGE: " -n -f 'red'; write-host $_.Exception.Message -f yellow
+        write-host "CATEGORY: " -n -f 'red'; write-host $_.CategoryInfo.Category -f yellow
+        write-host "TYPE: " -n -f 'red'; write-host $_.Exception.GetType().FullName -f yellow
+        write-host "ID: "  -n -f 'red'; write-host $_.FullyQualifiedErrorID -f yellow
+        write-host "LINE: " -n -f 'red'; write-host (($_.InvocationInfo.Line).trim()) -f yellow
+        write-host "STACK TRACE:" -f 'red'; write-host $_.ScriptStackTrace -f yellow
+        write-host "---- EXCEPTION DETAILS ----" -f 'red'
+        write-host ($_.Exception | fl -force | out-string).trim() -f yellow
+    }
+}}
+trap {
+    if (!$nonInteractive) {
+        $_ | Pretty-Exception
+    }
+    if ($ENV:TEAMCITY_DATA_PATH) {
+        write-host "##teamcity[message text='$($_.message)' status='FAILURE']"
+        [Environment]::Exit(1)
+    }
+    break
+}
+##############################################
+# Parameters
+##############################################
+$nugetTcPath = "%teamcity.tool.NuGet.CommandLine.DEFAULT%\tools\nuget.exe"
+if (!(Test-Path $nugetTcPath)) { throw "nuget.exe path invalid" }
+
+$nugetFeedBaseUrl = '%nugetpusher.feedbaseurl%'
+$nugetApiKey = '%nugetpusher.apikey%'
+
+$packageDirs = '%nugetpusher.packageDirs%'.Trim()
+$packageDirs = $packageDirs.Replace("`r",'').Split("`n")
+
+$recurse = '%nugetpusher.shouldRecurse%'.Trim()
+$recurse = [convert]::ToBoolean($recurse)
+
+$regexFilter = '%nugetpusher.regexFilter%'.Trim()
+
+# splats
+$recurseDir = @{}
+if ($recurse -eq $true) {
+    $recurseDir.Add('recurse',$true)
+} else {
+    $recurseDir.Add('recurse',$false)
+}
+$nugetSplat = @{}
+$nugetSplat.Add('nugetApiKey',$nugetApiKey)
+$nugetSplat.Add('nugetBinPath',$nugetTcPath)
+$nugetSplat.Add('nugetFeedBaseUrl',$nugetFeedBaseUrl)
+##############################################
+# func
+##############################################
+function Push-NupkgToRepo {
+param(
+    [ValidateNotNullOrEmpty()]
+    [ValidateSet('experimental','main','dev','octopack-release-archive','progettestingdontuse')]
+    [string]
+    $repoName = 'experimental',
+    [Parameter(ValueFromPipelineByPropertyName=$true)]
+    [Alias('fullname')]
+    [ValidateNotNullOrEmpty()]
+    [ValidateScript({ (Test-Path $_) -and ((gi $_).Extension -eq '.nupkg') })]
+    [string]
+    $package,
+    [ValidateNotNullOrEmpty()]
+    $nugetFeedBaseUrl,
+    [ValidateNotNullOrEmpty()]
+    [ValidateScript({ (Test-Path $_) -and ((gi $_).Extension -eq '.exe') })]
+    [string]
+    $nugetBinPath = ".\nuget.exe",
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $nugetApiKey
+)
+BEGIN {
+    $nugetRepoUrl = "$nugetFeedBaseUrl/$repoName"
+    if (!(Test-Path $nugetBinPath)) { throw "Cannot find nuget binary specified" }
+}
+PROCESS {
+    $packageFullPath = (gi $package).FullName
+    $packageName = (gi $package).Name
+    write-host "##teamcity[blockOpened name='Push $packageName']"
+    write-host "##teamcity[message text='Uploading $packageName' status='normal']"
+    & $nugetBinPath push $packageFullPath -s $nugetRepoUrl -apikey $nugetApiKey
+    write-host "Nuget.exe Exit Code: $LASTEXITCODE"
+    write-host "##teamcity[blockClosed name='Push $packageName']"
+}}
+##############################################
+# main
+##############################################
+# ---- Return Fast ----
+$packageDirsThatExist = $packageDirs | ? { ![string]::IsNullOrEmpty($_) -and ($_.trim() -ne [string]::Empty) -and (Test-Path $_) }
+if (!$packageDirsThatExist) {
+    write-host "No specified paths exist"
+    return
+}
+$packageSearch = Get-ChildItem $packageDirsThatExist -filter *.nupkg -ea 0
+if (!$packageSearch) {
+    write-host "No .nupkg in any directory specified"
+    return
+}
+
+$packages = @()
+# ---- Gather ----
+write-host "##teamcity[blockOpened name='Gathering NuGet Files']"
+foreach ($packageDir in $packageDirs) {
+    if (!(Test-Path $packageDir)) {
+        write-host "##teamcity[message text='Could not find directory $packageDir' status='normal']"
+    } else {
+        $packagesInDir = ls -path $packageDir -filter *.nupkg @recurseDir
+        $packagesInDirCount = ($packagesInDir | measure).count
+        write-host "##teamcity[message text='$packagesInDirCount .nupkg in $packageDir' status='normal']"
+        if ($packagesInDir) {
+            $packages += $packagesInDir
+        }
+    }
+}
+$packagesCount = ($packages | measure).count
+write-host "##teamcity[message text='$packagesCount .nupkg TOTAL' status='normal']"
+if ($packagesCount -eq 0) { return }
+write-host "##teamcity[message text='Filtering Packages based on $regexFilter' status='normal']"
+$filteredPackages = $packages | ? { $_.name -match $regexFilter }
+$filteredPackagesCount = ($filteredPackages | measure).count
+write-host "##teamcity[message text='$filteredPackagesCount filtered packages' status='normal']"
+if ($filteredPackagesCount -eq 0) { return }
+write-host "##teamcity[message text='Sorting packages for repo destination' status='normal']"
+$main = $filteredPackages | ? { $_.name -notlike '*-*' } |
+                            ? { $_.name -notlike "*.development*" } |
+                            ? { $_.name -notlike "*.trunk*" }
+$dev = $filteredPackages | ? { $main.name -notcontains $_.name }
+$mainCount = ($main | measure).count
+$devCount = ($dev | measure).count
+write-host "##teamcity[message text='$mainCount main packages, $devCount dev packages (including symbol packages)' status='normal']"
+write-host "##teamcity[blockClosed name='Gathering NuGet Files']"
+
+# ---- Upload main ----
+if ($main) {
+    write-host "##teamcity[blockOpened name='Uploading MAIN repo files']"
+    $main | ? { $_.name -notlike '*.symbols.nupkg' } | Push-NupkgToRepo -repoName 'main' @nugetSplat
+    write-host "##teamcity[blockClosed name='Uploading MAIN repo files']"
+}
+# ---- Upload dev ----
+if ($dev) {
+    write-host "##teamcity[blockOpened name='Uploading DEV repo files']"
+    $dev | ? { $_.name -notlike '*.symbols.nupkg' } | Push-NupkgToRepo -repoName 'dev' @nugetSplat
+    write-host "##teamcity[blockClosed name='Uploading DEV repo files']"
+}]]></param>
+          <param name="jetbrains_powershell_script_mode" value="CODE" />
+          <param name="teamcity.step.mode" value="default" />
+        </parameters>
+      </runner>
+    </build-runners>
+    <requirements />
+  </settings>
+</meta-runner>
+

@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<meta-runner name="Nuget Pack 2">
+  <description>Runs default nuget instance to PACK .nuspec files. Will not fail build if no .nuspec files are found.</description>
+  <settings>
+    <parameters>
+      <param name="nugetPacker.nuspecDirs" value="" spec="text description='New-line delmiited list of directories to look for .nuspec files' label='NuSpec Path(s)' validationMode='any' display='normal'" />
+      <param name="nugetPacker.outputDir" value="%teamcity.build.checkoutDir%" spec="text description='The directory which packed .NUPKG files will be created. If not specified, defaults to PWD.' label='NuGet Output Directory' validationMode='any' display='normal'" />
+      <param name="nugetPacker.version" value="%build.number%" spec="text description='Nupkg Package Version.' label='NuGet Version' validationMode='any' display='normal'" />
+      <param name="nugetPacker.nugetProps" value="" spec="text description='New-line delimited list of KEY=VALUE properties which are passed to NuGet for use as replacement tokens.' label='NuGet Properties' validationMode='any' display='normal'" />
+      <param name="nugetPacker.baseDir" value="%teamcity.build.checkoutDir%" spec="text description='The base directory of which relative paths specified in the .nuspec files will be referenced against' label='NuGet Base Directory' validationMode='any' display='normal'" />
+      <param name="nugetPacker.regexFilter" value=".*" spec="text description='NuSpec file names are filtered against this regex. If not specified, will default to .*' label='NuSpec Filename Regex Filter' validationMode='any' display='normal'" />
+      <param name="nugetPacker.shouldRecurse" value="true" spec="select description='Use a recursive search when looking for .nuspec files in a folder' label='NuSpec Recursive Search' data_2='false' data_1='true' display='normal'" />
+      <param name="nugetPacker.publishArtifacts" value="true" spec="select description='Publish created .nupkg files as build artifacts.' label='Publish Artifacts' data_2='false' data_1='true' display='normal'" />
+      <param name="nugetPacker.publishArtifactsDestDir" value="." spec="text description='i.e. the right-side of the ANT-style rule: x =&gt; dest. If not specified, defaults to top or artifacts path.' label='Publish Artifacts Destination' validationMode='any' display='normal'" />
+    </parameters>
+    <build-runners>
+      <runner name="NuGet Pack" type="jetbrains_powershell">
+        <parameters>
+          <param name="jetbrains_powershell_bitness" value="x64" />
+          <param name="jetbrains_powershell_execution" value="PS1" />
+          <param name="jetbrains_powershell_minVersion" value="3.0" />
+          <param name="jetbrains_powershell_noprofile" value="true" />
+          <param name="jetbrains_powershell_script_code"><![CDATA[<#
+    .SYNOPSIS
+    TeamCity Nuget PACK wrapper
+    
+    .DESCRIPTION
+    Uses default teamcity NuGet tool package to PACK a set of nuspec files in multiple paths. Unlike the default runner, this will not fail if no nuspec are found.
+#>
+function Pretty-Exception {
+param(
+    [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+    [System.Management.Automation.ErrorRecord[]]
+    $exceptions
+)
+PROCESS {
+    $exceptions | % {
+        write-host "---------------------------------------" -f 'red'
+        write-host "ERROR RECORD" -f 'red'
+        write-host "---------------------------------------" -f 'red'
+        write-host "MESSAGE: " -n -f 'red'; write-host $_.Exception.Message -f yellow
+        write-host "CATEGORY: " -n -f 'red'; write-host $_.CategoryInfo.Category -f yellow
+        write-host "TYPE: " -n -f 'red'; write-host $_.Exception.GetType().FullName -f yellow
+        write-host "ID: "  -n -f 'red'; write-host $_.FullyQualifiedErrorID -f yellow
+        write-host "LINE: " -n -f 'red'; write-host (($_.InvocationInfo.Line).trim()) -f yellow
+        write-host "STACK TRACE:" -f 'red'; write-host $_.ScriptStackTrace -f yellow
+        write-host "---- EXCEPTION DETAILS ----" -f 'red'
+        write-host ($_.Exception | fl -force | out-string).trim() -f yellow
+    }
+}}
+trap {
+    if (!$nonInteractive) {
+        $_ | Pretty-Exception
+    }
+    if ($ENV:TEAMCITY_DATA_PATH) {
+        write-host "##teamcity[message text='$($_.message)' status='FAILURE']"
+        [Environment]::Exit(1)
+    }
+    break
+}
+##############################################
+# Parameters
+##############################################
+$nugetTcPath = "%teamcity.tool.NuGet.CommandLine.DEFAULT%\tools\nuget.exe".Trim()
+if (!(Test-Path $nugetTcPath)) { throw "nuget.exe path invalid" }
+
+$nuspecDirs = '%nugetPacker.nuspecDirs%'.Trim()
+$nuspecDirs = $nuspecDirs.Replace("`r",'').Split("`n")
+
+$nugetVersion = '%nugetPacker.version%'.Trim()
+
+$nugetProps = '%nugetPacker.nugetProps%'.Trim()
+$nugetProps = $nugetProps.Replace("`r",'').Split("`n")
+
+$publishArtifacts = '%nugetPacker.publishArtifacts%'.Trim()
+$publishArtifacts = [convert]::ToBoolean($publishArtifacts)
+
+$publishArtifactsDestDir = '%nugetPacker.publishArtifactsDestDir%'.Trim()
+$outputDir = '%nugetPacker.outputDir%'.Trim()
+$baseDir = '%nugetPacker.baseDir%'.Trim()
+$regexFilter = '%nugetPacker.regexFilter%'.Trim()
+
+# ---- splats ----
+$recurse = '%nugetPacker.shouldRecurse%'.Trim()
+$recurse = [convert]::ToBoolean($recurse)
+$recurseDir = @{}
+if ($recurse -eq $true) {
+    $recurseDir.Add('recurse',$true)
+} else {
+    $recurseDir.Add('recurse',$false)
+}
+##############################################
+# main
+##############################################
+# ---- Return fast ----
+$nuspecDirsThatExist = $nuspecDirs | ? { ![string]::IsNullOrEmpty($_) -and ($_.trim() -ne [string]::Empty) -and (Test-Path $_) }
+if (!$nuspecDirsThatExist) {
+    write-host "No specified paths exist"
+    return
+}
+$nuspecSearch = Get-ChildItem $nuspecDirsThatExist -Filter *.nuspec -ea 0 @recurseDir
+if (!$nuspecSearch) {
+    write-host "No .nuspec in any directory specified"
+    return
+}
+
+# ---- Gather ----
+$nuspec = @()
+write-host "##teamcity[blockOpened name='Gathering NuSpec Files']"
+foreach ($nuspecDir in $nuspecDirs) {
+    if (!(Test-Path $nuspecDir)) {
+        write-host "##teamcity[message text='Could not find directory $nuspecDir' status='normal']"
+    } else {
+        $nuspecInDir = ls -path $nuspecDir -filter *.nuspec @recurseDir
+        $nuspecInDirCount = ($nuspecInDir | measure).count
+        write-host "##teamcity[message text='$nuspecInDirCount .nuspec in $nuspecDir' status='normal']"
+        if ($nuspecInDir) {
+            $nuspec += $nuspecInDir
+        }
+    }
+}
+# Totals
+$nuspecCount = ($nuspec | measure).count
+write-host "##teamcity[message text='$nuspecCount .nuspec TOTAL' status='normal']"
+
+# Return if no .nuspec files
+if ($nuspecCount -eq 0) { return }
+
+# Filter
+if([string]::IsNullOrEmpty($regexFilter)) {
+    $regexFilter = '.*'
+}
+write-host "##teamcity[message text='Filtering nuspec based on $regexFilter' status='normal']"
+$filteredNuspec = $nuspec | ? { $_.name -match $regexFilter }
+$filteredNuspecCount = ($filteredNuspec | measure).count
+write-host "##teamcity[message text='$filteredNuspecCount filtered nuspec' status='normal']"
+
+# Return if no .nuspec files after filtering
+if ($filteredNuspecCount -eq 0) { return }
+
+write-host "##teamcity[blockClosed name='Gathering NuSpec Files']"
+# ---- Nuget Pack ----
+write-host "##teamcity[blockOpened name='Packing NuGet Files']"
+$nugetArgs = @()
+$nugetPropsStr = $nugetProps -join ';'
+if ( ($nugetPropsStr.Length -gt 0) -and ($nugetPropsStr.Trim() -ne [string]::Empty) ) {
+    $nugetArgs += @('-Properties',$nugetPropsStr)
+}
+if ($baseDir) {
+    $nugetArgs += @('-BasePath',$baseDir)
+}
+if ($outputDir) {
+    $nugetArgs += @('-OutputDirectory',$outputDir)
+}
+if ($nugetVersion) {
+    $nugetArgs += @('-Version',$nugetVersion)
+}
+$nugetArgs += '-NonInteractive'
+
+foreach ($nuspecFile in $filteredNuspec) {
+    write-host "##teamcity[blockOpened name='Packing $($nuspecFile.name)']"
+    $nugetPackArgs = @('pack',$nuspecFile.fullname) + $nugetArgs
+    & $nugetTcPath $nugetPackArgs
+    write-host "Nuget.exe EXIT CODE: $LASTEXITCODE"
+    if ($LASTEXITCODE -ne 0) { throw "Nuget Pack Error" }
+    write-host "##teamcity[blockClosed name='Packing $($nuspecFile.name)']"
+}
+write-host "##teamcity[blockClosed name='Packing NuGet Files']"
+
+# ---- Publish Artifacts ----
+if ($publishArtifacts -eq $true) {
+    write-host "##teamcity[blockOpened name='Publishing Artifacts']"
+    $nupkgDir = $PWD.path
+    if ($outputDir) {
+        $nupkgDir = $outputDir
+    }
+    if ([string]::IsNullOrEmpty($publishArtifactsDestDir)) {
+        $publishArtifactsDestDir = '.'
+    }
+    write-host "##teamcity[publishArtifacts '$outputDir\**.nupkg => $publishArtifactsDestDir']"
+    write-host "##teamcity[blockClosed name='Publishing Artifacts']"
+}]]></param>
+          <param name="jetbrains_powershell_script_mode" value="CODE" />
+          <param name="teamcity.step.mode" value="default" />
+        </parameters>
+      </runner>
+    </build-runners>
+    <requirements />
+  </settings>
+</meta-runner>
+

@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<meta-runner name="Release Notes - Generate Markdown File (SVN)">
+  <description>Generates a release notes markdown file using (optional) user input and teamcity pending VCS changes</description>
+  <settings>
+    <parameters>
+      <param name="releasenotes.extraNotes" value="" spec="text description='Add additional release note information.' label='Release Notes (markdown)' validationMode='any' display='normal'" />
+      <param name="releasenotes.filepath" value="" spec="text description='Where will the markdown file be saved?' label='Output FilePath' validationMode='not_empty' display='normal'" />
+      <param name="releasenotes.releaseNotesTitle" value="" spec="text description='Title which gets prepended to the top header' label='Title' validationMode='not_empty' display='normal'" />
+    </parameters>
+    <build-runners>
+      <runner name="Generate Markdown File" type="jetbrains_powershell">
+        <parameters>
+          <param name="jetbrains_powershell_bitness" value="x64" />
+          <param name="jetbrains_powershell_execution" value="PS1" />
+          <param name="jetbrains_powershell_noprofile" value="true" />
+          <param name="jetbrains_powershell_script_code"><![CDATA[# ---- build step parameters ----
+$outputFilePath = '%releasenotes.filepath%'
+$releaseNotesTitle = '%releasenotes.releaseNotesTitle%'
+$releasenotesExtra = '%releasenotes.extraNotes%'
+
+# ---- teamcity ----
+$buildId = '%teamcity.build.id%'
+$checkoutDir = '%teamcity.build.checkoutDir%'
+$triggeredBy = '%teamcity.build.triggeredBy%'
+$buildNumber = '%system.build.number%'
+$teamcityUrl = "%teamcity.serverUrl%"
+$authToken=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("%system.teamcity.auth.userId%:%system.teamcity.auth.password%"))
+
+################################################################
+# Error unfolding
+################################################################
+function Pretty-Exception {
+param(
+    [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+    [System.Management.Automation.ErrorRecord[]]
+    $exceptions
+)
+PROCESS {
+    $exceptions | % {
+        write-host "---------------------------------------" -f 'red'
+        write-host "ERROR RECORD" -f 'red'
+        write-host "---------------------------------------" -f 'red'
+        write-host "MESSAGE: " -n -f 'red'; write-host $_.Exception.Message -f yellow
+        write-host "CATEGORY: " -n -f 'red'; write-host $_.CategoryInfo.Category -f yellow
+        write-host "TYPE: " -n -f 'red'; write-host $_.Exception.GetType().FullName -f yellow
+        write-host "ID: "  -n -f 'red'; write-host $_.FullyQualifiedErrorID -f yellow
+        write-host "LINE: " -n -f 'red'; write-host (($_.InvocationInfo.Line).trim()) -f yellow
+        write-host "STACK TRACE:" -f 'red'; write-host $_.ScriptStackTrace -f yellow
+        write-host "---- EXCEPTION DETAILS ----" -f 'red'
+        write-host ($_.Exception | fl -force | out-string).trim() -f yellow
+    }
+}}
+trap {
+    if (!$nonInteractive) {
+        $_ | Pretty-Exception
+    }
+    if ($ENV:TEAMCITY_DATA_PATH) {
+        write-host "##teamcity[message text='$($_.message)' status='FAILURE']"
+        [Environment]::Exit(1)
+    }
+    break
+}
+
+################################################################
+# func
+################################################################
+function Invoke-TeamCityApi {
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$urlPath,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$teamcityUrl,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$authToken
+)
+    $url = "$($teamcityUrl)/httpAuth/app/rest/$urlPath"
+    $request = [System.Net.WebRequest]::Create($url)
+    $request.Headers.Add("AUTHORIZATION", "$authToken");
+    [xml](new-object System.IO.StreamReader $request.GetResponse().GetResponseStream()).ReadToEnd()
+    if (!$?) { throw "Unable to query teamcity api" }
+}
+function Get-BuildChangeIDs {
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$buildId,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$teamcityUrl,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$authToken
+)
+    [hashtable]$passedApiInfo = @{ teamcityUrl = $teamcityUrl; authToken = $authToken }
+    Invoke-TeamCityApi -urlPath "changes?build=id:$($buildId)" @passedApiInfo |   
+    Select-Xml -XPath "/changes/change" |
+    foreach {
+        new-object psobject -property @{
+            changeId = [int]$_.Node.id
+        }
+    }
+}
+Function Get-PendingChanges
+{
+param(
+    [Parameter(Mandatory=$true,ValueFromPipeline=$true,ValueFromPipelineByPropertyName=$true)]
+    [ValidateNotNullOrEmpty()]
+    [int[]]$changeId,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$teamcityUrl,
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$authToken
+)
+BEGIN {
+    [hashtable]$passedApiInfo = @{ teamcityUrl = $teamcityUrl; authToken = $authToken }
+}
+PROCESS {
+    foreach($cId in $changeId) {
+        Invoke-TeamCityApi -urlPath "changes/id:$cId" @passedApiInfo |
+        Select-Xml -XPath "/change" |
+        where { (-Not $_.Node["comment"].InnerText.Contains('#ignore')) } |
+        foreach {
+            $comment = 'n/a'
+            if ($_.Node["comment"].InnerText.Length) {
+                $comment = $_.Node["comment"].InnerText.Trim()
+            }
+            new-object psobject -property @{
+                revision = $_.Node.version
+                user = $_.Node["user"].username
+                userDisplay = $_.Node["user"].name
+                comment = $comment
+            }
+        }
+    }
+}}
+function Get-SvnInfo {
+    [xml]$svnInfoXml = (svn info --xml)
+    if (!$?) {
+        write-error "Could not get SVN info"
+        return
+    }
+    new-object psobject -property @{
+        url = $svnInfoXml.info.entry.url
+        relativeUrl = $svnInfoXml.info.entry.'relative-url'
+        repositoryUrl = $svnInfoXml.info.entry.repository.root
+        uuid = $svnInfoXml.info.entry.repository.uuid
+        commitRevision = $svnInfoXml.info.entry.commit.revision
+    }
+}
+################################################################
+# main
+################################################################
+# API Splat
+[hashtable]$apiSplat = @{
+    authToken = $authToken
+    teamcityUrl = $teamcityUrl
+}
+# newline helpers
+$nl = [environment]::NewLine
+$markDownNl = '  '
+
+# ---- generate markdown ----
+$markDown = ""
+
+# Header
+write-host "Generating header markdown"
+$svnInfo = Get-SvnInfo
+$tcBuildLogUrl = "$teamcityUrl/viewLog.html?buildId=$buildId"
+if (!$triggeredBy) { $triggeredBy = 'VCS Trigger' }
+$markDown += "## $releaseNotesTitle $buildNumber (Build $buildId) ##" + $nl
+$markDown += '`' + (get-date -f 'yyyy-MM-dd HH:mm:ss zz') + '`'
+$markDown += ' / UTC: `' + (get-date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + '`' + $markDownNl + $nl
+$markDown += "**Triggered By:** $triggeredBy" + $markDownNl + $nl
+$markDown += '**SVN uuid:** `' + $svnInfo.uuid + '`' + $markDownNl + $nl
+$markDown += '**SVN path:** `' + $svnInfo.relativeUrl + '`' + $markDownNl + $nl
+$markDown += '[SVN URL](' + $svnInfo.url + ')' + ' | '
+$markDown += '[TC Build Log](' + $tcBuildLogUrl + ')' + $markDownNl + $nl
+$markDown += $nl
+
+# Release Notes
+write-host "Check for user specified release notes (if any)"
+if ($releasenotesExtra) {
+    write-host "Adding release notes markdown"
+    $markDown += '## Release Notes ##' + $nl
+    $markDown += $releasenotesExtra + $nl
+}
+
+# VCS Changes
+write-host "Querying VCS changes"
+$vcsChanges = Get-BuildChangeIDs -buildId $buildId @apiSplat | Get-PendingChanges @apiSplat
+if ($vcsChanges) {
+    write-host "Adding VCS changes markdown"
+    $markDown += '## VCS Changes ##' + $nl
+    foreach ($change in $vcsChanges) {
+        $markDown += '### Rev: ' + $change.revision + ' (' + $change.userDisplay + ') ###' + $nl
+        $markDown += $change.comment + $nl
+    }
+}
+
+# Save markdown file
+write-host "Saving markdown file to $outputFilePath"
+$markDown | Out-File -FilePath $outputFilePath -Force
+if (!$?) { throw "Error saving markdown file" }
+
+# Publish artifact
+mkdir "$checkoutDir\releasenotes" -force -ea 0 | out-null
+cp -path $outputFilePath -destination "$checkoutDir\releasenotes" -force
+write-host "##teamcity[publishArtifacts '\releasenotes']"]]></param>
+          <param name="jetbrains_powershell_script_mode" value="CODE" />
+          <param name="teamcity.step.mode" value="default" />
+        </parameters>
+      </runner>
+    </build-runners>
+    <requirements />
+  </settings>
+</meta-runner>
+

@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<meta-runner name="Octo - Create Releases from JSON Mapping File">
+  <description>Create Octopus Releases using a JSON mapping file</description>
+  <settings>
+    <parameters>
+      <param name="octo.release.mappingFilePath" value="" spec="text description='Path to the JSON file that maps releases to projects.' label='Release JSON Mapping Path' validationMode='not_empty' display='normal'" />
+      <param name="octo.release.packageVersion" value="" spec="text description='Package Version(s) to use for the release' label='Package Version' validationMode='not_empty' display='normal'" />
+      <param name="octo.release.channel" value="" spec="text description='Octopus Project Release Channel' label='Release Channel' validationMode='not_empty' display='normal'" />
+      <param name="octo.release.version" value="" spec="text description='The version to mark the Release with. Can be same as package version.' label='Release Version' validationMode='not_empty' display='normal'" />
+      <param name="octo.release.releasenotesFile" value="" spec="text description='Path to markdown text file to use as release notes' label='Release Notes File Path' validationMode='not_empty' display='normal'" />
+      <param name="octopus.server.url" value="" spec="text label='Octopus Server URL' validationMode='not_empty' display='normal'" />
+      <param name="octopus.server.Apikey" value="zxx775d03cbe80d301b" spec="password description='API Key which can create releases for the desired channel.' label='Octopus Server API Key' display='normal'" />
+    </parameters>
+    <build-runners>
+      <runner name="Octo - Create Releases from JSON Mapping File" type="jetbrains_powershell">
+        <parameters>
+          <param name="jetbrains_powershell_bitness" value="x64" />
+          <param name="jetbrains_powershell_execution" value="PS1" />
+          <param name="jetbrains_powershell_minVersion" value="3.0" />
+          <param name="jetbrains_powershell_noprofile" value="true" />
+          <param name="jetbrains_powershell_script_code"><![CDATA[#
+    .SYNOPSIS
+    Creates Octopus Release(s) based on a JSON Mapping File
+    
+    .DESCRIPTION
+    Create releases in a specific Octopus Deploy Channel using an API key.
+    
+    Requires a JSON mapping file which maps .nupkg to Octopus Deploy Projects
+#>
+function Pretty-Exception {
+param(
+    [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+    [System.Management.Automation.ErrorRecord[]]
+    $exceptions
+)
+PROCESS {
+    $exceptions | % {
+        write-host "---------------------------------------" -f 'red'
+        write-host "ERROR RECORD" -f 'red'
+        write-host "---------------------------------------" -f 'red'
+        write-host "MESSAGE: " -n -f 'red'; write-host $_.Exception.Message -f yellow
+        write-host "CATEGORY: " -n -f 'red'; write-host $_.CategoryInfo.Category -f yellow
+        write-host "TYPE: " -n -f 'red'; write-host $_.Exception.GetType().FullName -f yellow
+        write-host "ID: "  -n -f 'red'; write-host $_.FullyQualifiedErrorID -f yellow
+        write-host "LINE: " -n -f 'red'; write-host (($_.InvocationInfo.Line).trim()) -f yellow
+        write-host "STACK TRACE:" -f 'red'; write-host $_.ScriptStackTrace -f yellow
+        write-host "---- EXCEPTION DETAILS ----" -f 'red'
+        write-host ($_.Exception | fl -force | out-string).trim() -f yellow
+    }
+}}
+trap {
+    if (!$nonInteractive) {
+        $_ | Pretty-Exception
+    }
+    if ($ENV:TEAMCITY_DATA_PATH) {
+        write-host "##teamcity[message text='$($_.message)' status='FAILURE']"
+        [Environment]::Exit(1)
+    }
+    break
+}
+##############################################
+# Parameters
+##############################################
+$octoBinPath = '%teamcity.tool.octo%\octo.exe'.trim()
+$octoServerUrl = '%octopus.server.url%'.trim()
+$octoApikey = "%octopus.server.Apikey%"
+
+$octoReleaseMappingFilePath = '%octo.release.mappingFilePath%'.trim()
+$octoReleaseChannel = '%octo.release.channel%'.trim()
+$octoReleaseVersion = '%octo.release.version%'.trim()
+$octoPackageVersion = '%octo.release.packageVersion%'.trim()
+$releasenotesfile = '%octo.release.releasenotesFile%'.trim()
+
+##############################################
+# main
+##############################################
+# ---- Validation ----
+if (!(Test-Path $octoBinPath)) { throw "Cannot find octobin path" }
+if (!(Test-Path $octoReleaseMappingFilePath)) { throw "Cannot find JSON mapping file" }
+
+# ---- Import Mapping ----
+write-host "Parsing JSON mappings"
+$json = [system.io.file]::ReadAllText($octoReleaseMappingFilePath)
+if ([string]::IsNullOrEmpty($json)) {
+    throw "JSON mapping empty"
+}
+$octoReleaseMapping = ConvertFrom-Json $json
+if (!$?) {
+    throw "Cannot process JSON mapping"
+}
+
+# ---- Create Releases ----
+foreach ($release in $octoReleaseMapping.releases) {
+    write-host "##teamcity[blockOpened name='Project $($release.project)']"
+    $octoArgs = @()
+    $octoArgs += 'create-release'
+    $octoArgs += @('--project',$release.project)
+    $octoArgs += @('--channel',$octoReleaseChannel)
+    $octoArgs += @('--version',$octoReleaseVersion)
+    $octoArgs += @('--packageversion',$octoPackageVersion)
+    $octoArgs += @('--server',$octoServerUrl)
+    $octoArgs += @('--apiKey',$octoApikey)
+    $octoArgs += @('--releasenotesfile',$releasenotesfile)
+    write-host "Creating release $octoReleaseVersion packageVersion $octoPackageVersion on Server $octoServerUrl"
+    & $octoBinPath $octoArgs
+    write-host "Octopack exited with code $LASTEXITCODE"
+    if (@(0) -notcontains $LASTEXITCODE) {
+        throw "Octopack error"
+    }
+    write-host "##teamcity[blockClosed name='Project $($release.project)']"
+}]]></param>
+          <param name="jetbrains_powershell_script_mode" value="CODE" />
+          <param name="teamcity.step.mode" value="default" />
+        </parameters>
+      </runner>
+    </build-runners>
+    <requirements />
+  </settings>
+</meta-runner>
+
