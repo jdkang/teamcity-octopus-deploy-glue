@@ -5,10 +5,6 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 
-/*
-    Based on: https://github.com/OctopusDeploy/Calamari/blob/94e883c84e8605a7b032492e23e813e369811733/source/Calamari/Integration/ConfigurationTransforms/VerboseTransformLogger.cs
-*/
-
 namespace Calamari.Xdt {
     public class VerboseTransformLogger : IXmlTransformationLogger
     {
