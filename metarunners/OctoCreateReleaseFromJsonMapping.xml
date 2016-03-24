@@ -18,7 +18,7 @@
           <param name="jetbrains_powershell_execution" value="PS1" />
           <param name="jetbrains_powershell_minVersion" value="3.0" />
           <param name="jetbrains_powershell_noprofile" value="true" />
-          <param name="jetbrains_powershell_script_code"><![CDATA[#
+          <param name="jetbrains_powershell_script_code"><![CDATA[<#
     .SYNOPSIS
     Creates Octopus Release(s) based on a JSON Mapping File
     
